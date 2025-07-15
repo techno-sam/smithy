@@ -1,9 +1,10 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use fuser::{FileAttr, FileType, Filesystem, FUSE_ROOT_ID};
+use int_enum::IntEnum;
 use libc::ENOENT;
 use log::debug;
 
-use crate::anvil::RegionFile;
+use crate::anvil::{Chunk, RegionFile};
 
 
 const TTL: Duration = Duration::from_secs(1);
@@ -11,7 +12,7 @@ const ROOT_DIR_ATTR: FileAttr = fattr(FUSE_ROOT_ID, 0, UNIX_EPOCH, FileType::Dir
 
 
 const fn fattr(ino: u64, size: u64, time: SystemTime, kind: FileType, perm: u16, nlink: u32, uid: u32, gid: u32) -> FileAttr {
-    let blksize: u32 = 512;
+    let blksize: u32 = 4096;
     let blocks = size.div_ceil(blksize as u64);
 
     FileAttr {
@@ -34,7 +35,7 @@ const fn fattr(ino: u64, size: u64, time: SystemTime, kind: FileType, perm: u16,
 }
 
 
-fn parse_file_name(name: &str) -> Option<(u8, u8)> {
+fn parse_file_name(name: &str) -> Option<(u8, u8, FileKind)> {
     enum FSM {
         Uninit,
         X{x: u8, n: u8},
@@ -42,10 +43,7 @@ fn parse_file_name(name: &str) -> Option<(u8, u8)> {
     }
     use FSM::*;
 
-    if !name.ends_with(".nbt") {
-        return None;
-    }
-    let name = &name[0..name.len()-4];
+    let (fkind, name) = FileKind::parse_extension(name)?;
 
     let mut chars = name.chars();
     let mut state = Uninit;
@@ -94,32 +92,77 @@ fn parse_file_name(name: &str) -> Option<(u8, u8)> {
     }
 
     match state {
-        Z{x, z, n} if n < 2 => Some((x, z)),
+        Z{x, z, n} if n < 2 => Some((x, z, fkind)),
         _ => None
     }
 }
 
 
-const MIN_COORD_INODE: u64 = coords_to_inode(0, 0);
-const MAX_COORD_INODE: u64 = coords_to_inode(31, 31);
+fn make_compression_info(chunk: &Chunk<'_>) -> String {
+    return format!(
+        "# The value in this file MUST match the actual compression of {}\n{}\n",
+        FileKind::Chunk.make_fname(chunk.x, chunk.z),
+        chunk.compression_type.make_selector_string()
+    );
+}
 
-#[inline(always)]
-const fn coords_to_inode(x: u8, z: u8) -> u64 {
-    let x = (x & 31) as u64;
-    let z = (z & 31) as u64;
 
-    return FUSE_ROOT_ID + 1 + (x + z*32);
+const INODE_BASE: u64 = FUSE_ROOT_ID + 1;
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, IntEnum)]
+enum FileKind {
+    Chunk = 0,
+    CompressionInfo  = 1
+}
+impl FileKind {
+    const VARIANTS: u64 = 2;
+
+    fn make_fname(self, x: u8, z: u8) -> String {
+        let ext = match self {
+            Self::Chunk => ".nbt",
+            Self::CompressionInfo => ".cmp",
+        };
+
+        format!("x{}z{}{}", x, z, ext)
+    }
+
+    fn parse_extension(fname: &str) -> Option<(Self, &str)> {
+        if fname.len() < 4 {
+            return None;
+        }
+
+        match &fname[fname.len()-4..] {
+            ".nbt" => Some((Self::Chunk, &fname[0..fname.len()-4])),
+            ".cmp" => Some((Self::CompressionInfo, &fname[0..fname.len()-4])),
+            _ => None
+        }
+    }
 }
 
 #[inline(always)]
-fn inode_to_coords(inode: u64) -> Option<(u8, u8)> {
-    if MIN_COORD_INODE <= inode && inode <= MAX_COORD_INODE {
-        let packed = inode - 1 - FUSE_ROOT_ID;
+const fn coords_to_inode(x: u8, z: u8, kind: FileKind) -> u64 {
+    let x = (x & 31) as u64;
+    let z = (z & 31) as u64;
+    let kind = kind as u8 as u64;
+
+    let encoded = x | (z << 5) | (kind << 10);
+
+    return INODE_BASE + encoded;
+}
+
+#[inline(always)]
+fn inode_to_coords(inode: u64) -> Option<(u8, u8, FileKind)> {
+    if inode < INODE_BASE || inode >> 18 != 0 {
+        return None;
+    } else {
+        let packed = inode - INODE_BASE;
         let x = (packed & 31) as u8;
         let z = ((packed >> 5) & 31) as u8;
-        Some((x, z))
-    } else {
-        None
+        let kind = ((packed >> 10) & 0xff) as u8;
+        let kind: FileKind = kind.try_into().ok()?;
+
+        Some((x, z, kind))
     }
 }
 
@@ -145,11 +188,16 @@ impl<'a> SmithyFS<'a> {
         }
     }
 
-    fn chunk_attr(&self, x: u8, z: u8) -> FileAttr {
-        let chunk = self.region.lookup_chunk(x, z);
+    fn chunk_attr(&self, x: u8, z: u8, kind: FileKind) -> Option<FileAttr> {
+        let chunk = self.region.lookup_chunk(x, z)?;
         let time = self.region.lookup_timestamp(x, z);
 
-        fattr(coords_to_inode(x, z), chunk.data.len() as u64, time, FileType::RegularFile, 0o444, 1, self.uid, self.gid)
+        let len = match kind {
+            FileKind::Chunk => chunk.data.len(),
+            FileKind::CompressionInfo => make_compression_info(&chunk).len(),
+        };
+
+        Some(fattr(coords_to_inode(x, z, kind), len as u64, time, FileType::RegularFile, 0o444, 1, self.uid, self.gid))
     }
 }
 
@@ -162,11 +210,14 @@ impl Filesystem for SmithyFS<'_> {
 
         debug!("Lookup in {} of {:?}", parent, name);
 
-        if let Some((x, z)) = name.to_str().and_then(parse_file_name) {
-            debug!("Parsed file name as chunk ({}, {})", x, z);
+        if let Some((x, z, kind)) = name.to_str().and_then(parse_file_name) {
+            debug!("Parsed file name as chunk ({}, {}) {:?}", x, z, kind);
             if x < 32 && z < 32 {
-                reply.entry(&TTL, &self.chunk_attr(x, z), 0);
-                return;
+                if let Some(attr) = self.chunk_attr(x, z, kind) {
+                    reply.entry(&TTL, &attr, 0);
+                    return;
+                }
+                debug!("Chunk ({}, {}) is missing", x, z);
             }
         }
 
@@ -177,8 +228,8 @@ impl Filesystem for SmithyFS<'_> {
     fn getattr(&mut self, _req: &fuser::Request<'_>, ino: u64, _fh: Option<u64>, reply: fuser::ReplyAttr) {
         if ino == FUSE_ROOT_ID {
             reply.attr(&TTL, &self.root_dir_attr);
-        } else if let Some((x, z)) = inode_to_coords(ino) {
-            reply.attr(&TTL, &self.chunk_attr(x, z));
+        } else if let Some(attr) = inode_to_coords(ino).and_then(|(x, z, kind)| self.chunk_attr(x, z, kind)) {
+            reply.attr(&TTL, &attr);
         } else {
             reply.error(ENOENT);
         }
@@ -195,21 +246,44 @@ impl Filesystem for SmithyFS<'_> {
             _lock_owner: Option<u64>,
             reply: fuser::ReplyData,
         ) {
-        if let Some((x, z)) = inode_to_coords(ino) {
-            let chunk = self.region.lookup_chunk(x, z).data;
+        if let Some((x, z, kind)) = inode_to_coords(ino) {
+            if let Some(chunk) = self.region.lookup_chunk(x, z) {
+                match kind {
+                    FileKind::Chunk => {
+                        let chunk = chunk.data;
 
-            let offset = offset as usize;
-            let size = size as usize;
+                        let offset = offset as usize;
+                        let size = size as usize;
 
-            if offset >= chunk.len() {
-                reply.data(&[]);
-            } else {
-                let end = (offset + size).min(chunk.len());
-                reply.data(&chunk[offset..end]);
+                        if offset >= chunk.len() {
+                            reply.data(&[]);
+                        } else {
+                            let end = (offset + size).min(chunk.len());
+                            reply.data(&chunk[offset..end]);
+                        }
+
+                        return;
+                    }
+                    FileKind::CompressionInfo => {
+                        let info = make_compression_info(&chunk);
+
+                        let offset = offset as usize;
+                        let size = size as usize;
+
+                        if offset >= info.len() {
+                            reply.data(&[]);
+                        } else {
+                            let end = (offset + size).min(info.len());
+                            reply.data(&info[offset..end].as_bytes());
+                        }
+
+                        return;
+                    }
+                }
             }
-        } else {
-            reply.error(ENOENT)
         }
+
+        reply.error(ENOENT)
     }
 
     fn readdir(
@@ -226,7 +300,7 @@ impl Filesystem for SmithyFS<'_> {
         }
 
         // '.', '..', and the nbt files
-        let count = 2 + (31 + 31 * 32);
+        let count = 2 + (31 + 31 * 32) * FileKind::VARIANTS;
 
         for i in (offset as u64)..count {
             let (inode, file_type, name) = match i {
@@ -236,7 +310,8 @@ impl Filesystem for SmithyFS<'_> {
                     let packed = packed - 2;
                     let x = (packed & 31) as u8;
                     let z = ((packed >> 5) & 31) as u8;
-                    (coords_to_inode(x, z), FileType::RegularFile, &format!("x{x}z{z}.nbt") as &str)
+                    let kind = (((packed >> 10) & 0xff) as u8).try_into().unwrap();
+                    (coords_to_inode(x, z, kind), FileType::RegularFile, &kind.make_fname(x, z) as &str)
                 }
             };
 

@@ -48,23 +48,50 @@ impl RegionFile<'_> {
         SystemTime::UNIX_EPOCH + Duration::from_secs(timestamp as u64)
     }
 
-    pub(crate) fn lookup_chunk(&self, chunk_x: u8, chunk_z: u8) -> Chunk<'_> {
+    pub(crate) fn lookup_chunk(&self, chunk_x: u8, chunk_z: u8) -> Option<Chunk<'_>> {
         let ptr = self.lookup_ptr(chunk_x, chunk_z);
+
+        if ptr.offset < 2 || ptr.len == 0 {
+            return None;
+        }
 
         let start = (ptr.offset as usize) * 4096;
         let len = (ptr.len as usize) * 4096;
 
+        if start + len > self.data.len() {
+            return None;
+        }
+
         let chunk_data = &self.data[start..start+len];
 
         let true_len = read_big_endian(&chunk_data, 0) as usize;
-        //let compression_type = chunk_data[4];
-        let chunk_data = &chunk_data[5..5 + true_len - 1];
+        let compression_type = CompressionType::decode(chunk_data[4]);
 
-        Chunk {
+        if let CompressionType::Unknown(id) = compression_type {
+            if id >= 128 { // stored externally
+                return None;
+            }
+        }
+
+        if true_len <= 1 {
+            return None;
+        }
+
+        let start = 5;
+        let len = true_len - 1;
+
+        if start + len > chunk_data.len() {
+            return None;
+        }
+
+        let chunk_data = &chunk_data[start..start + len];
+
+        Some(Chunk {
             x: chunk_x & 31,
             z: chunk_z & 31,
+            compression_type,
             data: chunk_data
-        }
+        })
     }
 }
 
@@ -76,10 +103,76 @@ pub(crate) struct ChunkPtr {
     len: u32,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum CompressionType {
+    GZip,
+    Zlib,
+    None,
+    LZ4,
+    Zstd,
+    Unknown(u8),
+}
+impl CompressionType {
+    fn decode(id: u8) -> Self {
+        match id {
+             1 => Self::GZip,
+             2 => Self::Zlib,
+             3 => Self::None,
+             4 => Self::LZ4,
+            53 => Self::Zstd,
+
+            id => Self::Unknown(id)
+        }
+    }
+
+    fn encode(&self) -> u8 {
+        match self {
+            &Self::GZip => 1,
+            &Self::Zlib => 2,
+            &Self::None => 3,
+            &Self::LZ4 => 4,
+            &Self::Zstd => 53,
+
+            &Self::Unknown(id) => id
+        }
+    }
+
+    pub(crate) fn make_selector_string(&self) -> String {
+        match self {
+            &Self::GZip => "[gzip] zlib none lz4 zstd unknown(#)".to_owned(),
+            &Self::Zlib => "gzip [zlib] none lz4 zstd unknown(#)".to_owned(),
+            &Self::None => "gzip zlib [none] lz4 zstd unknown(#)".to_owned(),
+            &Self::LZ4 => "gzip zlib none [lz4] zstd unknown(#)".to_owned(),
+            &Self::Zstd => "gzip zlib none lz4 [zstd] unknown(#)".to_owned(),
+            &Self::Unknown(id) => format!("gzip zlib none lz4 zstd [unknown({})]", id)
+        }
+    }
+
+    pub(crate) fn parse_selector_string(selector: &str) -> Option<Self> {
+        match &selector.to_ascii_lowercase() as &str {
+            "gzip" => Some(Self::GZip),
+            "zlib" => Some(Self::Zlib),
+            "none" => Some(Self::None),
+            "lz4"  => Some(Self::LZ4),
+            "zstd" => Some(Self::Zstd),
+            mut s  => {
+                if s.starts_with("unknown(") && s.ends_with(")") {
+                    s = &s[8..s.len()-1];
+                }
+
+                s.parse::<u8>()
+                    .ok()
+                    .map(Self::decode)
+            }
+        }
+    }
+}
+
 #[allow(dead_code)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Chunk<'a> {
     pub(crate) x: u8,
     pub(crate) z: u8,
+    pub(crate) compression_type: CompressionType,
     pub(crate) data: &'a [u8]
 }
