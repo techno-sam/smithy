@@ -1,0 +1,20 @@
+[package]
+name = "smithy"
+version = "0.1.0"
+edition = "2024"
+description = "A utility to expose minecraft region files (.mca) as FUSE mounts"
+authors = ["Sam Wagenaar"]
+license = "AGPL-3.0-only"
+
+build = "build.rs"
+
+[dependencies]
+clap = { version = "4.5.41", features = ["derive"] }
+env_logger = "0.11.8"
+fuser = "0.15.1"
+libc = "0.2.174"
+log = "0.4.27"
+
+[build-dependencies]
+clap = { version = "4.5.41", features = ["derive"] }
+clap_complete = "4.5.55"
