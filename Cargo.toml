@@ -9,13 +9,16 @@ license = "AGPL-3.0-only"
 build = "build.rs"
 
 [dependencies]
+bitvec = "1.0.1"
 clap = { version = "4.5.41", features = ["derive"] }
 env_logger = "0.11.8"
-fuser = "0.15.1"
+fuser = { version = "0.15.1", features = ["abi-7-18"] }
 int-enum = "1.2.0"
 libc = "0.2.174"
 log = "0.4.27"
+regex = "1.11.1"
 
 [build-dependencies]
 clap = { version = "4.5.41", features = ["derive"] }
 clap_complete = "4.5.55"
+regex = "1.11.1"
