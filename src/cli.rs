@@ -1,6 +1,7 @@
 use clap::{ArgAction, Parser, ValueHint};
 use regex::Regex;
 
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct ExtendedFilename {
     pub fname: String,

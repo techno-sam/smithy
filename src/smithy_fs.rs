@@ -1,8 +1,8 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
 use fuser::{FileAttr, FileType, Filesystem, Notifier, FUSE_ROOT_ID};
 use int_enum::IntEnum;
-use libc::{EACCES, EBADF, EFBIG, EINVAL, ENOENT, ENOSYS, ENOTDIR, EROFS};
-use log::{debug, info, warn};
+use libc::{EACCES, EBADF, EEXIST, EFBIG, EINVAL, ENOENT, ENOSYS, ENOTDIR, EPERM, EROFS};
+use log::{debug, error, info, warn};
 
 use crate::anvil::{Chunk, CompressionType, RegionFile, MAX_CHUNK_LEN, SECTOR_LEN};
 
@@ -206,6 +206,13 @@ impl InodeData {
         }
     }
 
+    fn blank(kind: FileKind) -> Self {
+        match kind {
+            FileKind::Chunk => InodeData::Chunk(vec![]),
+            FileKind::CompressionInfo => InodeData::Info(CompressionType::Unknown(42)),
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             InodeData::Chunk(data) => data.len(),
@@ -320,6 +327,19 @@ impl Inode {
         }
     }
 
+    fn blank(x: u8, z: u8, inos: &InoSet, kind: FileKind) -> Self {
+        Self {
+            ino: inos.get(kind),
+            x,
+            z,
+            data: InodeData::blank(kind),
+            mtime: SystemTime::now(),
+            open_handles: HashMap::new(),
+            linked: true,
+            nlookup: 0
+        }
+    }
+
     fn attr(&self, writable: bool, uid: u32, gid: u32) -> FileAttr {
         let len = self.data.len();
         let perm = if writable { 0o644 } else { 0o444 };
@@ -333,7 +353,7 @@ impl Inode {
 
     fn dec_lookup(&mut self, count: u64) -> u64 {
         if self.nlookup < count {
-            panic!("Lookup count mismatch detected");
+            error!("Lookup count mismatch detected in {}. It may be wise to remount the smithy filesystem.", self.make_fname());
         }
 
         self.nlookup -= count;
@@ -342,6 +362,10 @@ impl Inode {
 
     fn can_discard(&self) -> bool {
         !self.linked && self.nlookup == 0 && self.open_handles.is_empty()
+    }
+
+    fn make_fname(&self) -> String {
+        self.data.kind().make_fname(self.x, self.z)
     }
 }
 
@@ -611,6 +635,56 @@ impl Filesystem for SmithyFS {
         }
     }
 
+    fn mknod(
+            &mut self,
+            _req: &fuser::Request<'_>,
+            parent: u64,
+            name: &std::ffi::OsStr,
+            mode: u32,
+            _umask: u32,
+            _rdev: u32,
+            reply: fuser::ReplyEntry,
+        ) {
+        if !self.writable {
+            reply.error(EROFS);
+            return;
+        }
+
+        if parent != FUSE_ROOT_ID {
+            reply.error(ENOENT);
+            return;
+        }
+
+        let file_type = mode & libc::S_IFMT;
+
+        if file_type != libc::S_IFREG {
+            reply.error(EPERM);
+            return;
+        }
+
+        let Some(key) = name.to_str().and_then(FileKey::parse) else {
+            reply.error(EINVAL);
+            return;
+        };
+
+        if self.links.contains_key(&(key.x, key.z)) {
+            reply.error(EEXIST);
+            return;
+        }
+
+        let inos = self.ino_alloc.allocate_inos();
+        let chunk_inode = Inode::blank(key.x, key.z, &inos, FileKind::Chunk);
+        let info_inode = Inode::blank(key.x, key.z, &inos, FileKind::CompressionInfo);
+
+        warn!("Make sure to set correct compression type in {}", info_inode.make_fname());
+
+        self.links.insert((key.x, key.z), inos);
+        self.inodes.insert(inos.chunk_ino, chunk_inode);
+        self.inodes.insert(inos.info_ino, info_inode);
+
+        reply.entry(&TTL, &self.stat_ino(inos.get(key.kind)).expect("just-created inode should exist"), 0);
+    }
+
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
         let (read, write) = match flags & libc::O_ACCMODE {
             libc::O_RDONLY => {
@@ -633,7 +707,7 @@ impl Filesystem for SmithyFS {
         };
 
         if write && !self.writable {
-            reply.error(EACCES);
+            reply.error(EROFS);
             return;
         }
 

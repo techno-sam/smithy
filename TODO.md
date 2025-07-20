@@ -1,7 +1,7 @@
 # smithy_fs
 - [x] lookup
 - [x] getattr
-- [ ] create - implement with an `import/<compression_type>/` folder
+- [x] create
 - [x] write
   - [ ] actually write-to-disk
 - [x] read

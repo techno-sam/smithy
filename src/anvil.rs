@@ -1,5 +1,5 @@
 use bitvec::prelude::*;
-use log::warn;
+use log::{debug, warn};
 use std::time::{Duration, SystemTime};
 
 pub(crate) const SECTOR_LEN: usize = 0x1000;
@@ -257,7 +257,10 @@ impl CompressionType {
     }
 
     pub(crate) fn parse_selector_string(selector: &str) -> Option<Self> {
-        match &selector.to_ascii_lowercase().trim() as &str {
+        let selector = selector.to_ascii_lowercase();
+        let selector: &str = selector.trim();
+
+        let out = match selector {
             "gzip" => Some(Self::GZip),
             "zlib" => Some(Self::Zlib),
             "none" => Some(Self::None),
@@ -272,7 +275,22 @@ impl CompressionType {
                     .ok()
                     .map(Self::decode)
             }
+        };
+
+        if out.is_some() {
+            return out;
         }
+
+        let start = selector.find('[')? + 1;
+        let len = selector[start..].find(']')?;
+
+        if len > 0 {
+            let part = &selector[start..start+len];
+            debug!("Recursively parsing `{}` (from `{}`)", part, selector);
+            return Self::parse_selector_string(&selector[start..start+len]);
+        }
+
+        None
     }
 }
 
