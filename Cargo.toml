@@ -1,6 +1,6 @@
 [package]
 name = "smithy"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A utility to expose minecraft region files (.mca) as FUSE mounts"
 authors = ["Sam Wagenaar"]

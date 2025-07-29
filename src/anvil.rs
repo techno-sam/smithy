@@ -1,10 +1,12 @@
 use bitvec::prelude::*;
-use log::{debug, warn};
-use std::time::{Duration, SystemTime};
+use log::{debug, info, warn};
+use std::{fs::File, io::{Seek, SeekFrom, Write}, time::{Duration, SystemTime}};
 
 pub(crate) const SECTOR_LEN: usize = 0x1000;
-const HEADER_LEN: usize = 0x2000;
+const HEADER_SECTORS: usize = 2;
+const HEADER_LEN: usize = HEADER_SECTORS * SECTOR_LEN;
 pub(crate) const MAX_CHUNK_LEN: usize = SECTOR_LEN * 254;
+const MAX_SECTORS: usize = 2_usize.pow(24) - 1 - HEADER_SECTORS;
 
 #[inline(always)]
 pub(crate) fn coords_to_idx(x: u8, z: u8) -> usize {
@@ -34,9 +36,7 @@ fn false_bitvec(len: usize) -> BitVec {
 pub(crate) struct RegionFile {
     headers: Box<[ChunkHeader; 32 * 32]>,
     chunk_data: Vec<u8>,
-    #[allow(unused)]
     occupied_sectors: BitVec,
-    #[allow(unused)]
     dirty_sectors: BitVec
 }
 
@@ -103,7 +103,7 @@ impl RegionFile {
             };
 
             if header.valid() {
-                occupied_sectors[(offset as usize)..(offset as usize + len as usize)].fill(true);
+                occupied_sectors[(offset as usize - HEADER_SECTORS)..(offset as usize + len as usize - HEADER_SECTORS)].fill(true);
             }
 
             headers.push(header);
@@ -125,17 +125,17 @@ impl RegionFile {
         &self.headers[idx]
     }
 
-    #[allow(unused)]
     #[inline(always)]
-    pub(crate) fn lookup_timestamp(&self, chunk_x: u8, chunk_z: u8) -> SystemTime {
-        self.lookup_header(chunk_x, chunk_z).mtime()
+    fn lookup_header_mut(&mut self, chunk_x: u8, chunk_z: u8) -> &mut ChunkHeader {
+        let idx = coords_to_idx(chunk_x, chunk_z) as usize;
+        &mut self.headers[idx]
     }
 
     pub(crate) fn lookup_chunk(&self, chunk_x: u8, chunk_z: u8) -> Option<Chunk<'_>> {
         let header = self.lookup_header(chunk_x, chunk_z);
         let addr = header.address?;
 
-        let start = (addr.offset as usize - 2) * SECTOR_LEN;
+        let start = (addr.offset as usize - HEADER_SECTORS) * SECTOR_LEN;
         let len = (addr.len as usize) * SECTOR_LEN;
 
         let chunk_data = &self.chunk_data[start..start+len];
@@ -155,6 +155,214 @@ impl RegionFile {
             data: chunk_data
         })
     }
+
+    pub(crate) fn delete_chunk(&mut self, chunk_x: u8, chunk_z: u8) {
+        let header = self.lookup_header_mut(chunk_x, chunk_z);
+        header.set_mtime(SystemTime::now());
+
+        self.free_chunk(chunk_x, chunk_z);
+    }
+
+    pub(crate) fn free_chunk(&mut self, chunk_x: u8, chunk_z: u8) {
+        let header = self.lookup_header_mut(chunk_x, chunk_z);
+        match header.address.take() {
+            Some(addr) => {
+                let start = addr.offset as usize - HEADER_SECTORS;
+                let end = (addr.offset + addr.len) as usize - HEADER_SECTORS;
+                let end = end.min(self.occupied_sectors.len());
+
+                if start < end {
+                    self.occupied_sectors[start..end].fill(false);
+                }
+            }
+            None => {}
+        };
+    }
+
+    fn allocate_run(&mut self, len: usize) -> Option<ChunkAddress> {
+        // first, try to find a sufficient-length run
+        let mut start = 0;
+
+        loop {
+            match self.occupied_sectors[start..].first_zero() {
+                Some(zero_offset) => {
+                    start = start + zero_offset;
+
+                    let search_end = (start + len).min(self.occupied_sectors.len());
+
+                    match self.occupied_sectors[start..search_end].first_one() {
+                        Some(one_offset) => { // doesn't fit, try again
+                            start = start + one_offset;
+                        }
+                        None => {
+                            let end = start + len;
+
+                            if end >= MAX_SECTORS {
+                                return None;
+                            }
+
+                            if end > self.occupied_sectors.len() {
+                                self.occupied_sectors[start..].fill(true);
+                                self.occupied_sectors.resize(end, true);
+                            } else {
+                                self.occupied_sectors[start..end].fill(true);
+                            }
+
+                            return Some(ChunkAddress { offset: (start + HEADER_SECTORS) as u32, len: len as u32 });
+                        }
+                    }
+                }
+                None => { // there's no more empty space, allocate
+                    start = self.occupied_sectors.len();
+
+                    if start + len >= MAX_SECTORS {
+                        return None;
+                    }
+
+                    self.occupied_sectors.resize(start + len, true);
+
+                    return Some(ChunkAddress { offset: (start + HEADER_SECTORS) as u32, len: len as u32 });
+                }
+            }
+        }
+    }
+
+    pub(crate) fn write_chunk(&mut self, chunk_x: u8, chunk_z: u8, data: &[u8], compression_type: CompressionType, mtime: SystemTime) {
+        self.free_chunk(chunk_x, chunk_z);
+
+        if data.len() >= MAX_CHUNK_LEN {
+            warn!("Chunk [{} {}] is too long, will silently be deleted", chunk_x, chunk_z);
+            return;
+        }
+
+        // add 5 bytes for Big Endian u32 length field and u8 compression type field
+        let meta_len = ChunkInternalMeta::LEN;
+        let container_len = data.len() + meta_len;
+
+        // allocate sectors
+        let addr = match self.allocate_run(container_len.div_ceil(SECTOR_LEN)) {
+            Some(addr) => addr,
+            None => {
+                warn!("Failed to allocate sectors for chunk [{} {}], will silently be deleted", chunk_x, chunk_z);
+                return;
+            }
+        };
+
+        // write data
+        {
+            let start = (addr.offset as usize - HEADER_SECTORS) * SECTOR_LEN;
+            let len = (addr.len as usize) * SECTOR_LEN;
+            let end = start + len;
+
+            if end > self.chunk_data.len() {
+                self.chunk_data.resize(end, 0);
+            }
+
+            let container_end = start + container_len;
+            if container_end < end {
+                self.chunk_data[container_end..end].fill(0);
+            }
+
+            // we have to add one to the data len, to account for the compression type field
+            let meta = ChunkInternalMeta { length: data.len() + 1, compression_type };
+            meta.write(&mut self.chunk_data[start..start+meta_len]);
+            self.chunk_data[start+meta_len..container_end].copy_from_slice(data);
+        }
+
+        // mark dirty
+        {
+            let start = addr.offset as usize - HEADER_SECTORS;
+            let end = start + (addr.len as usize);
+
+            if end > self.dirty_sectors.len() {
+                self.dirty_sectors[start..].fill(true);
+                self.dirty_sectors.resize(end, true);
+            } else {
+                self.dirty_sectors[start..end].fill(true);
+            }
+        }
+
+        // update header
+        let header = self.lookup_header_mut(chunk_x, chunk_z);
+        header.set_mtime(mtime);
+        header.address = Some(addr);
+    }
+
+    pub(crate) fn write_out(&mut self, full_write: bool, file: &mut File) -> std::io::Result<()> {
+        // start by truncating/allocating
+        let sector_count = self.headers.iter()
+            .map(|h| h.address)
+            .filter_map(|a| a)
+            .map(|a| (a.offset as usize) + (a.len as usize) - HEADER_SECTORS)
+            .max()
+            .unwrap_or(0);
+        file.set_len((HEADER_LEN + sector_count * SECTOR_LEN) as u64)?;
+
+        // always write header
+        file.seek(SeekFrom::Start(0))?;
+
+        // write first part of header (locations)
+        for idx in 0..(32*32) {
+            let header = self.headers[idx];
+
+            let (start, len) = match header.address {
+                Some(addr) => (addr.offset, addr.len),
+                None => (0, 0),
+            };
+
+            let data = [
+                ((start >> 16) & 0xff) as u8,
+                ((start >>  8) & 0xff) as u8,
+                ((start >>  0) & 0xff) as u8,
+                len as u8
+            ];
+
+            file.write_all(&data)?
+        }
+
+        // write second part of header (timestamps)
+        for idx in 0..(32*32) {
+            let header = self.headers[idx];
+            let mtime = header.mtime;
+
+            let data = [
+                ((mtime >> 24) & 0xff) as u8,
+                ((mtime >> 16) & 0xff) as u8,
+                ((mtime >>  8) & 0xff) as u8,
+                ((mtime >>  0) & 0xff) as u8,
+            ];
+
+            file.write_all(&data)?;
+        }
+
+        // write (changed) sectors
+
+        let sector_idx_iter: Box<dyn Iterator<Item=usize>> = if full_write {
+            Box::new((0..sector_count).into_iter())
+        } else {
+            Box::new(self.dirty_sectors.iter_ones().take_while(|idx| *idx < sector_count))
+        };
+
+        for sector_idx in sector_idx_iter {
+            if !full_write {
+                info!("> Writing sector {:#06x}", sector_idx);
+            }
+
+            let start = sector_idx * SECTOR_LEN;
+            let end = start + SECTOR_LEN;
+
+            file.seek(SeekFrom::Start((HEADER_LEN + start) as u64))?;
+            file.write_all(&self.chunk_data[start..end])?;
+        }
+
+        file.set_modified(SystemTime::now())?;
+        file.flush()?;
+        file.sync_all()?;
+
+        self.dirty_sectors.fill(false);
+
+        Ok(())
+    }
 }
 
 struct ChunkInternalMeta {
@@ -164,11 +372,22 @@ struct ChunkInternalMeta {
 }
 
 impl ChunkInternalMeta {
+    /// unit: bytes
+    const LEN: usize = 5;
+
     fn read(raw: &[u8]) -> Self {
         let length = read_big_endian(&raw, 0) as usize;
         let compression_type = CompressionType::decode(raw[4]);
 
         Self { length, compression_type }
+    }
+
+    fn write(&self, raw: &mut [u8]) {
+        raw[0] = ((self.length >> 24) & 0xff) as u8;
+        raw[1] = ((self.length >> 16) & 0xff) as u8;
+        raw[2] = ((self.length >>  8) & 0xff) as u8;
+        raw[3] = ((self.length >>  0) & 0xff) as u8;
+        raw[4] = self.compression_type.encode();
     }
 }
 
@@ -206,6 +425,13 @@ impl ChunkHeader {
 
     fn mtime(&self) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(self.mtime as u64)
+    }
+
+    fn set_mtime(&mut self, time: SystemTime) {
+        self.mtime = match time.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(dur) => dur.as_secs() as u32,
+            Err(_) => 0
+        };
     }
 }
 

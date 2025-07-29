@@ -25,7 +25,7 @@ impl ExtendedFilename {
 }
 
 #[derive(Parser)]
-#[command(name = "Smithy")]
+#[command(name = "Smithy", bin_name="smithy")]
 #[command(author)]
 #[command(version)]
 #[command(about)]

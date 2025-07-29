@@ -1,10 +1,11 @@
 use std::{collections::HashMap, sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use bitvec::{bitarr, order::Lsb0, BitArr};
 use fuser::{FileAttr, FileType, Filesystem, Notifier, FUSE_ROOT_ID};
 use int_enum::IntEnum;
 use libc::{EACCES, EBADF, EEXIST, EFBIG, EINVAL, ENOENT, ENOSYS, ENOTDIR, EPERM, EROFS};
 use log::{debug, error, info, warn};
 
-use crate::anvil::{Chunk, CompressionType, RegionFile, MAX_CHUNK_LEN, SECTOR_LEN};
+use crate::{anvil::{coords_to_idx, idx_to_coords, Chunk, CompressionType, RegionFile, MAX_CHUNK_LEN, SECTOR_LEN}, GuardedFile};
 
 
 const TTL: Duration = Duration::from_secs(1);
@@ -444,17 +445,20 @@ pub(crate) struct SmithyFS {
 
     links: HashMap<(u8, u8), InoSet>,
     inodes: HashMap<u64, Inode>,
+    dirty_chunks: BitArr!(for 32 * 32, in usize, Lsb0),
 
     dir_handles: HashMap<u64, DirHandle>,
 
     ino_alloc: InoAlloc,
     fh_alloc: FileHandleAlloc,
 
+    backing_file: GuardedFile,
+
     pub(crate) notifier: Arc<Mutex<Option<Notifier>>>
 }
 
 impl SmithyFS {
-    pub(crate) fn new(region: RegionFile, uid: u32, gid: u32, writable: bool) -> Self {
+    pub(crate) fn new(region: RegionFile, uid: u32, gid: u32, writable: bool, backing_file: GuardedFile) -> Self {
         let mut fs = Self {
             region,
             uid,
@@ -469,11 +473,14 @@ impl SmithyFS {
 
             links: HashMap::new(),
             inodes: HashMap::new(),
+            dirty_chunks: bitarr!(usize, Lsb0; 0; 32 * 32),
 
             dir_handles: HashMap::new(),
 
             ino_alloc: InoAlloc::new(),
             fh_alloc: FileHandleAlloc::new(),
+
+            backing_file,
 
             notifier: Arc::default()
         };
@@ -588,6 +595,95 @@ impl SmithyFS {
             warn!("Failed to acquire notifier lock. Deletion of inode {} will be silent.", ino);
         }
     }
+
+    /// Mark a chunk as needing to be saved
+    fn mark_dirty(&mut self, x: u8, z: u8) {
+        if !self.writable { // there's really no point
+            return;
+        }
+
+        self.dirty_chunks.set(coords_to_idx(x, z), true);
+        debug!("Marked chunk [{} {}] as dirty", x, z);
+    }
+
+    /// Actually save data to disk
+    fn write_back(&mut self) {
+        if !self.writable {
+            warn!("Read-only but asked to write???");
+            return;
+        }
+
+        info!("Writing all changes to mounted file");
+
+        let mut deleted_chunks = vec![];
+        let mut modified_chunks = vec![];
+
+        for dirty_idx in self.dirty_chunks.iter_ones() {
+            let (x, z) = idx_to_coords(dirty_idx);
+
+            let inodes = self.links.get(&(x, z))
+                .map_or(
+                    (None, None),
+                    |inos| (self.inodes.get(&inos.chunk_ino), self.inodes.get(&inos.info_ino)),
+                );
+
+            match inodes {
+                (
+                    Some(Inode {
+                        data: InodeData::Chunk(chunk_data),
+                        mtime,
+                        ..
+                    }),
+                    Some(Inode {
+                        data: InodeData::Info(compression_type),
+                        ..
+                    })
+                ) => {
+                    info!("> Writing chunk [{} {}]", x, z);
+                    modified_chunks.push((x, z, chunk_data, compression_type, mtime));
+                }
+                (Some(_), Some(_)) => warn!("> Chunk [{} {}] is broken and cannot be written", x, z),
+                _ => {
+                    info!("> Writing deletion of chunk [{} {}]", x, z);
+                    deleted_chunks.push((x, z));
+                }
+            }
+        }
+
+        // Delete chunks first to free up sectors
+        for (x, z) in deleted_chunks {
+            self.region.delete_chunk(x, z);
+        }
+
+        // Then free sectors from modified chunks
+        for &(x, z, _, _, _) in &modified_chunks {
+            self.region.free_chunk(x, z);
+        }
+
+        // write biggest chunks first, to reduce fragmentation
+        modified_chunks.sort_unstable_by_key(|(_, _, data, _, _)| usize::MAX - data.len());
+
+        // Then write modified chunks
+        for &(x, z, data, compression_type, mtime) in &modified_chunks {
+            self.region.write_chunk(x, z, data, *compression_type, *mtime);
+        }
+
+        // write out to disk
+        let (full_write, file) = self.backing_file.get_mut();
+        if full_write {
+            info!("> Writing all sectors");
+        } else {
+            info!("> Writing changed sectors");
+        }
+        match self.region.write_out(full_write, file) {
+            Ok(()) => {
+                self.dirty_chunks.fill(false);
+            }
+            Err(err) => {
+                error!("Failed to write out region: {}", err);
+            }
+        }
+    }
 }
 
 impl Filesystem for SmithyFS {
@@ -681,6 +777,8 @@ impl Filesystem for SmithyFS {
         self.links.insert((key.x, key.z), inos);
         self.inodes.insert(inos.chunk_ino, chunk_inode);
         self.inodes.insert(inos.info_ino, info_inode);
+
+        self.mark_dirty(key.x, key.z);
 
         reply.entry(&TTL, &self.stat_ino(inos.get(key.kind)).expect("just-created inode should exist"), 0);
     }
@@ -806,6 +904,15 @@ impl Filesystem for SmithyFS {
 
         if handle.can_write() {
             inode.data.write(offset, data, reply);
+            inode.mtime = SystemTime::now();
+
+            // because the borrow checker (reasonably) doesn't trust us here. Perhaps separated
+            // fields would be good (but a pain). Rust could benefit from "field-restricted
+            // references" so that we can tell the compiler that SmithyFS::mark_dirty doesn't need
+            // access to the inodes field.
+            // TODO: ^ RFC this? ^
+            let (x, z) = (inode.x, inode.z);
+            self.mark_dirty(x, z);
         } else {
             reply.error(EACCES);
         }
@@ -869,7 +976,7 @@ impl Filesystem for SmithyFS {
             fh: u64,
             _flags: i32,
             _lock_owner: Option<u64>,
-            _flush: bool,
+            flush: bool,
             reply: fuser::ReplyEmpty,
         ) {
         let inode = match self.inodes.get_mut(&ino) {
@@ -883,6 +990,10 @@ impl Filesystem for SmithyFS {
         match inode.open_handles.remove(&fh) {
             Some(_) => {
                 self.gc(ino);
+
+                if flush && self.writable {
+                    self.write_back();
+                }
 
                 reply.ok();
                 return;
@@ -949,7 +1060,12 @@ impl Filesystem for SmithyFS {
                 InodeData::Info(_) => {}
             }
 
-            reply.attr(&TTL, &inode.attr(self.writable, self.uid, self.gid));
+            let attr = inode.attr(self.writable, self.uid, self.gid);
+            let (x, z) = (inode.x, inode.z);
+
+            self.mark_dirty(x, z);
+
+            reply.attr(&TTL, &attr);
             return;
         }
 
@@ -989,10 +1105,13 @@ impl Filesystem for SmithyFS {
                     None => continue
                 };
 
+                let (x, z) = (inode.x, inode.z);
+
                 inode.linked = false;
                 to_delete.push(DeletionInfo::from(inode));
 
                 self.gc(ino);
+                self.mark_dirty(x, z);
             }
 
             if !to_delete.is_empty() {
@@ -1002,10 +1121,46 @@ impl Filesystem for SmithyFS {
                     self.delete(del_info);
                 }
 
+                self.write_back();
+
                 return;
             }
         }
 
         reply.error(ENOENT);
+    }
+
+    fn flush(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, _lock_owner: u64, reply: fuser::ReplyEmpty) {
+        if !self.writable {
+            reply.error(ENOSYS);
+            return;
+        }
+
+        let write_mode = self.inodes.get(&ino)
+            .and_then(|inode| inode.open_handles.get(&fh))
+            .map_or(false, FileHandle::can_write);
+
+        if write_mode {
+            self.write_back();
+        }
+
+        reply.ok();
+    }
+
+    fn fsync(&mut self, _req: &fuser::Request<'_>, ino: u64, fh: u64, _datasync: bool, reply: fuser::ReplyEmpty) {
+        if !self.writable {
+            reply.error(ENOSYS);
+            return;
+        }
+
+        let write_mode = self.inodes.get(&ino)
+            .and_then(|inode| inode.open_handles.get(&fh))
+            .map_or(false, FileHandle::can_write);
+
+        if write_mode {
+            self.write_back();
+        }
+
+        reply.ok();
     }
 }

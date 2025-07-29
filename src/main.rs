@@ -1,18 +1,25 @@
-use std::sync::Arc;
+use std::{io::Read, sync::Arc};
 
 use anvil::RegionFile;
 use clap::Parser;
 use fuser::MountOption;
 use libc::{getegid, geteuid};
+use log::{debug, error, info};
 use smithy_fs::SmithyFS;
 use cli::Cli;
+use util::GuardedFile;
 
+mod util;
 mod smithy_fs;
 mod cli;
 mod anvil;
 
 fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default()
+        .default_filter_or("info")
+    ).init();
+
     let args: Cli = Parser::parse();
 
     let mut options = vec![
@@ -34,18 +41,31 @@ fn main() {
         options.push(MountOption::AutoUnmount);
     }
 
-    let data = std::fs::read(&args.region_file.fname).expect("Failed to write source file");
+    let file = GuardedFile::new(&args.region_file.fname, args.writable).expect("Failed to find source file");
+    let data = {
+        let mut data = vec![];
+        let read = file.get().read_to_end(&mut data).expect("Failed to read source file");
+        debug!("Read {} bytes", read);
+        data
+    };
     let region = RegionFile::new(data);
 
     let uid = unsafe { geteuid() };
     let gid = unsafe { getegid() };
 
-    println!("Exposing {} via FUSE at {}", args.region_file.fname, args.mount_point);
+    info!("Exposing {} via FUSE at {}", args.region_file.fname, args.mount_point);
 
-    let fs = SmithyFS::new(region, uid, gid, args.writable);
+    let fs = SmithyFS::new(region, uid, gid, args.writable, file);
     let notif_mutex = Arc::clone(&fs.notifier);
 
-    let mut session = fuser::Session::new(fs, args.mount_point, &options).unwrap();
+    let mut session = match fuser::Session::new(fs, args.mount_point, &options) {
+        Ok(s) => s,
+        Err(e) => {
+            error!("Failed to create FUSE session: {}", e);
+            return;
+        }
+    };
+
     let notifier = session.notifier();
 
     {
@@ -54,5 +74,7 @@ fn main() {
 
     session.run().unwrap();
 
-    println!("Unmounted cleanly");
+    drop(session);
+
+    info!("Unmounted cleanly");
 }
