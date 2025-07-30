@@ -5,6 +5,7 @@ edition = "2024"
 description = "A utility to expose minecraft region files (.mca) as FUSE mounts"
 authors = ["Sam Wagenaar"]
 license = "AGPL-3.0-only"
+repository = "https://github.com/techno-sam/smithy"
 
 [dependencies]
 bitvec = "1.0.1"
