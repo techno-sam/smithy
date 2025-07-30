@@ -2,10 +2,14 @@
 name = "smithy"
 version = "0.2.0"
 edition = "2024"
-description = "A utility to expose minecraft region files (.mca) as FUSE mounts"
+description = "A command line utility to mount Minecraft region files (.mca) as FUSE directories"
 authors = ["Sam Wagenaar"]
 license = "AGPL-3.0-only"
 repository = "https://github.com/techno-sam/smithy"
+readme = "README.md"
+
+keywords = ["minecraft", "region", "anvil", "nbt"]
+categories = ["command-line-utilities", "filesystem"]
 
 [dependencies]
 bitvec = "1.0.1"
