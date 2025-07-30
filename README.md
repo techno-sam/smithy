@@ -41,21 +41,21 @@ source <(smithy completion --shell <SHELL>)
 
 #### Bash
 ```sh
-CDIR="${XDG_DATA_HOME:-~/.local/share}/bash-completion/completions"
+CDIR="${XDG_DATA_HOME:-/home/`whoami`/.local/share}/bash-completion/completions"
 mkdir -vp $CDIR
 smithy completion --shell bash --out-dir "$CDIR"
 ```
 
 #### Fish
 ```sh
-CDIR="${XDG_DATA_HOME:-~/.local/share}/fish/vendor_completions.d"
+CDIR="${XDG_DATA_HOME:-/home/`whoami`/.local/share}/fish/vendor_completions.d"
 mkdir -vp $CDIR
 smithy completion --shell fish --out-dir "$CDIR"
 ```
 
 #### Oh My Zsh
 ```sh
-CDIR="~/.oh-my-zsh/custom/completions"
+CDIR="/home/`whoami`/.oh-my-zsh/custom/completions"
 mkdir -vp $CDIR
 smithy completion --shell bash --out-dir "$CDIR"
 ```
