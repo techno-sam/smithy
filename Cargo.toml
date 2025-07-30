@@ -6,11 +6,10 @@ description = "A utility to expose minecraft region files (.mca) as FUSE mounts"
 authors = ["Sam Wagenaar"]
 license = "AGPL-3.0-only"
 
-build = "build.rs"
-
 [dependencies]
 bitvec = "1.0.1"
 clap = { version = "4.5.41", features = ["derive"] }
+clap_complete = "4.5.55"
 env_logger = "0.11.8"
 fuser = { version = "0.15.1", features = ["abi-7-18"] }
 int-enum = "1.2.0"

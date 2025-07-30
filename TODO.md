@@ -3,7 +3,7 @@
 - [x] getattr
 - [x] create
 - [x] write
-  - [ ] actually write-to-disk
+  - [x] actually write-to-disk
 - [x] read
 - [x] open
 - [x] opendir
@@ -15,6 +15,6 @@
 - [x] unlink
 - [ ] rename?
 - [ ] ~~link~~
-- [ ] flush?
-- [ ] fsync?
+- [x] flush?
+- [x] fsync?
 

@@ -1,4 +1,5 @@
-use clap::{ArgAction, Parser, ValueHint};
+use clap::{ArgAction, Parser, ValueHint, Subcommand, Args};
+use clap_complete::Shell;
 use regex::Regex;
 
 #[allow(dead_code)]
@@ -30,6 +31,20 @@ impl ExtendedFilename {
 #[command(version)]
 #[command(about)]
 pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command
+}
+
+#[derive(Subcommand)]
+pub enum Command {
+    /// Mount a region file as a directory
+    Mount(MountCmd),
+    /// Generate shell completions
+    Completion(CompletionCmd),
+}
+
+#[derive(Args)]
+pub struct MountCmd {
     /// Region (Anvil) file to mount
     #[arg(value_hint=ValueHint::FilePath, value_parser=ExtendedFilename::parse)]
     pub region_file: ExtendedFilename,
@@ -49,3 +64,14 @@ pub struct Cli {
     pub auto_unmount: bool,
 }
 
+#[derive(Args)]
+pub struct CompletionCmd {
+    #[arg(long, short)]
+    #[arg(value_enum)]
+    pub shell: Shell,
+
+    /// Location to create completions script, or blank for stdout
+    #[arg(long, short)]
+    #[arg(value_hint=ValueHint::DirPath)]
+    pub out_dir: Option<String>
+}

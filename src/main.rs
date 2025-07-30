@@ -1,12 +1,12 @@
 use std::{io::Read, sync::Arc};
 
 use anvil::RegionFile;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::{generate, generate_to};
 use fuser::MountOption;
 use libc::{getegid, geteuid};
 use log::{debug, error, info};
 use smithy_fs::SmithyFS;
-use cli::Cli;
 use util::GuardedFile;
 
 mod util;
@@ -20,8 +20,15 @@ fn main() {
         .default_filter_or("info")
     ).init();
 
-    let args: Cli = Parser::parse();
+    let args: cli::Cli = Parser::parse();
 
+    match args.command {
+        cli::Command::Mount(args) => run_mount(args),
+        cli::Command::Completion(args) => run_completion(args),
+    }
+}
+
+fn run_mount(args: cli::MountCmd) {
     let mut options = vec![
         MountOption::NoAtime,
         MountOption::NoSuid,
@@ -77,4 +84,23 @@ fn main() {
     drop(session);
 
     info!("Unmounted cleanly");
+}
+
+fn run_completion(args: cli::CompletionCmd) {
+    let bin_name = option_env!("CARGO_BIN_NAME").unwrap_or("smithy");
+    let mut cmd = <cli::Cli as CommandFactory>::command();
+
+    match args.out_dir {
+        Some(out_dir) => {
+            match generate_to(args.shell, &mut cmd, bin_name, out_dir) {
+                Ok(path) => {
+                    info!("Wrote completions file to: {}", path.display());
+                }
+                Err(err) => {
+                    error!("Failed to write completions file: {}", err);
+                }
+            }
+        }
+        None => generate(args.shell, &mut cmd, bin_name, &mut std::io::stdout()),
+    };
 }
